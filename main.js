@@ -6,6 +6,8 @@
  */
 const fs = require('node:fs');
 const path = require('node:path');
+const http = require('node:http');
+const crypto = require('node:crypto');
 const {setTimeout: sleep} = require('node:timers/promises');
 
 const TZ = 'Europe/Moscow';
@@ -30,7 +32,10 @@ function config(env = process.env) {
   if (!owners.size) throw new Error('OWNER_TELEGRAM_IDS_REQUIRED');
   const dataDir = path.resolve(String(env.BOT_DATA_DIR || './data'));
   const reminderDays = new Set(String(env.REMINDER_DAYS || '1,2,3,4,5,6,7').split(',').map(Number).filter(n => n >= 1 && n <= 7));
-  return {token, owners, dataDir, dbFile: path.join(dataDir, 'daily_reports.json'), reminderDays};
+  const webhookUrl = String(env.WEBHOOK_URL || '').trim().replace(/\/+$/, '');
+  if (webhookUrl && !/^https:\/\/[^\s]+$/i.test(webhookUrl)) throw new Error('WEBHOOK_URL_MUST_BE_HTTPS');
+  const webhookSecret = String(env.WEBHOOK_SECRET || crypto.createHash('sha256').update(token).digest('base64url').slice(0, 32));
+  return {token, owners, dataDir, dbFile: path.join(dataDir, 'daily_reports.json'), reminderDays, webhookUrl, webhookSecret};
 }
 function moscow(now = new Date()) {
   const fmt = new Intl.DateTimeFormat('en-CA', {timeZone: TZ, year: 'numeric', month: '2-digit', day: '2-digit',
@@ -294,7 +299,7 @@ class DailyReportsBot {
   }
 }
 
-async function run(app, signal, log = console.log) {
+async function runPolling(app, signal, log = console.log) {
   const hook = await app.telegram.call('getWebhookInfo'); if (hook.url) throw new Error('WEBHOOK_ALREADY_SET');
   let offset = Number(app.store.data.offset || 0), failures = 0, nextReminder = 0;
   log('READY: server storage connected; long polling started.');
@@ -311,6 +316,40 @@ async function run(app, signal, log = console.log) {
     }
   }
 }
+
+function webhookPath(webhookUrl) { return new URL(webhookUrl).pathname || '/'; }
+function readJson(request) {
+  return new Promise((resolve, reject) => {
+    let size = 0, body = '';
+    request.setEncoding('utf8');
+    request.on('data', chunk => {
+      size += Buffer.byteLength(chunk);
+      if (size > 1_000_000) { reject(new Error('WEBHOOK_BODY_TOO_LARGE')); request.destroy(); return; }
+      body += chunk;
+    });
+    request.on('end', () => { try { resolve(JSON.parse(body)); } catch (_) { reject(new Error('WEBHOOK_INVALID_JSON')); } });
+    request.on('error', reject);
+  });
+}
+async function runWebhook(app, signal, log = console.log) {
+  const port = Number(process.env.PORT || 3000), endpoint = webhookPath(app.config.webhookUrl);
+  const server = http.createServer(async (request, response) => {
+    if (request.method !== 'POST' || new URL(request.url, 'http://localhost').pathname !== endpoint) { response.writeHead(404); response.end(); return; }
+    if (request.headers['x-telegram-bot-api-secret-token'] !== app.config.webhookSecret) { response.writeHead(403); response.end(); return; }
+    try { await app.update(await readJson(request)); response.writeHead(200); response.end('ok'); }
+    catch (error) { console.error(`WEBHOOK: ${error.message}`); response.writeHead(500); response.end(); }
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(port, '0.0.0.0', resolve); });
+  try {
+    await app.telegram.call('setWebhook', {url: app.config.webhookUrl, secret_token: app.config.webhookSecret, allowed_updates: ['message', 'callback_query'], drop_pending_updates: false});
+    log(`READY: webhook connected at ${endpoint}; server storage connected.`);
+    const timer = setInterval(() => app.reminder().catch(error => console.error(`REMINDER: ${error.message}`)), 30000);
+    await app.reminder();
+    await new Promise(resolve => signal.addEventListener('abort', resolve, {once: true}));
+    clearInterval(timer);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+}
+function run(app, signal, log = console.log) { return app.config.webhookUrl ? runWebhook(app, signal, log) : runPolling(app, signal, log); }
 if (require.main === module) {
   const options = config(), store = new Store(options.dbFile), telegram = new Telegram(options.token), app = new DailyReportsBot({store, telegram, config: options});
   const controller = new AbortController(); process.on('SIGINT', () => controller.abort()); process.on('SIGTERM', () => controller.abort());
